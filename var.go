@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+        "gopkg.in/yaml.v2"
 )
 
 // Var struct
@@ -17,6 +18,7 @@ type Var struct {
 	Type     reflect.Type
 	Value    reflect.Value
 	Required bool
+        Yaml     bool
 	Default  reflect.Value
 	Options  []reflect.Value
 }
@@ -32,11 +34,20 @@ func NewVarWithFunc(field reflect.StructField, get func(string) string) (*Var, e
 	newVar := &Var{} //Default: reflect.ValueOf(nil)}
 	newVar.Parse(field)
 
-	value, err := convert(newVar.Type, get(newVar.Key))
-	if err != nil {
-		return newVar, err
-	}
-	newVar.SetValue(value)
+        var value reflect.Value
+        var err error
+
+        if newVar.Yaml {
+            value, err = convertYaml(newVar.Type, get(newVar.Key))
+        } else {
+            value, err = convert(newVar.Type, get(newVar.Key))
+        }
+
+        if err != nil {
+                return newVar, err
+        }
+
+        newVar.SetValue(value)
 
 	if value == reflect.ValueOf(nil) {
 		if newVar.Required {
@@ -91,6 +102,11 @@ func (v *Var) SetRequired(value bool) {
 	v.Required = value
 }
 
+// SetYaml sets Var.Yaml
+func (v *Var) SetYaml(value bool) {
+        v.Yaml = value
+}
+
 // SetDefault sets Var.Default
 func (v *Var) SetDefault(value reflect.Value) {
 	v.Default = value
@@ -143,6 +159,9 @@ func (v *Var) Parse(field reflect.StructField) error {
 			// if val != false {
 			v.SetRequired(true)
 			// }
+                case "yaml":
+                        // set yaml conversion to true
+                        v.SetYaml(true)
 		case "default":
 			d, err := convert(v.Type, value)
 			if err != nil {
@@ -165,6 +184,19 @@ func (v *Var) Parse(field reflect.StructField) error {
 	}
 
 	return nil
+}
+
+func convertYaml(t reflect.Type, value string) (reflect.Value, error) {
+    var a []interface{}
+
+    err := yaml.Unmarshal([]byte(value), &a)
+
+    if err != nil {
+        fmt.Print(err)
+        return reflect.ValueOf(nil), conversionError(value, `yaml conversion error of ` + t.Kind().String())
+    }
+
+    return reflect.ValueOf(a), nil
 }
 
 // Convert a string into the specified type. Return the type's zero value
