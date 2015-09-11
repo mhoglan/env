@@ -187,16 +187,16 @@ func (v *Var) Parse(field reflect.StructField) error {
 }
 
 func convertYaml(t reflect.Type, value string) (reflect.Value, error) {
-    var a []interface{}
+    a := reflect.New(t)
 
-    err := yaml.Unmarshal([]byte(value), &a)
+    err := yaml.Unmarshal([]byte(value), a.Interface())
 
     if err != nil {
         fmt.Print(err)
         return reflect.ValueOf(nil), conversionError(value, `yaml conversion error of ` + t.Kind().String())
     }
 
-    return reflect.ValueOf(a), nil
+    return a.Elem(), nil
 }
 
 // Convert a string into the specified type. Return the type's zero value
