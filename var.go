@@ -8,19 +8,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
-        "gopkg.in/yaml.v2"
+	// YAML not included in golang encode package
+	"gopkg.in/yaml.v2"
 )
 
 // Var struct
 type Var struct {
-	Name     string
-	Key      string
-	Type     reflect.Type
-	Value    reflect.Value
-	Required bool
-        Yaml     bool
-	Default  reflect.Value
-	Options  []reflect.Value
+	Name        string
+	Key         string
+	Type        reflect.Type
+	Value       reflect.Value
+	Required    bool
+	Decode      string
+	Default     reflect.Value
+	Options     []reflect.Value
 }
 
 // NewVar returns a new Var
@@ -34,20 +35,16 @@ func NewVarWithFunc(field reflect.StructField, get func(string) string) (*Var, e
 	newVar := &Var{} //Default: reflect.ValueOf(nil)}
 	newVar.Parse(field)
 
-        var value reflect.Value
-        var err error
+	var value reflect.Value
+	var err error
 
-        if newVar.Yaml {
-            value, err = convertYaml(newVar.Type, get(newVar.Key))
-        } else {
-            value, err = convert(newVar.Type, get(newVar.Key))
-        }
+	value, err = convert(newVar.Type, get(newVar.Key), newVar.Decode)
 
-        if err != nil {
-                return newVar, err
-        }
+	if err != nil {
+		return newVar, err
+	}
 
-        newVar.SetValue(value)
+	newVar.SetValue(value)
 
 	if value == reflect.ValueOf(nil) {
 		if newVar.Required {
@@ -102,9 +99,8 @@ func (v *Var) SetRequired(value bool) {
 	v.Required = value
 }
 
-// SetYaml sets Var.Yaml
-func (v *Var) SetYaml(value bool) {
-        v.Yaml = value
+func (v *Var) SetDecode(value string) {
+	v.Decode = value
 }
 
 // SetDefault sets Var.Default
@@ -140,7 +136,12 @@ func (v *Var) Parse(field reflect.StructField) error {
 		return nil
 	}
 
+	// Use a map so we can process in specific order with lookups
+	// Needed to get the decode param processed first
+	tagParamsMap := make(map[string]string)
+
 	tagParams := strings.Split(tag, " ")
+
 	for _, tagParam := range tagParams {
 		var key, value string
 
@@ -150,6 +151,19 @@ func (v *Var) Parse(field reflect.StructField) error {
 			value = option[1]
 		}
 
+		tagParamsMap[key] = value
+	}
+
+	// Process the decode tag
+	// Need to be first so we can decode default / options
+	if value, ok := tagParamsMap["decode"]; ok {
+		v.SetDecode(value)
+		// remove the tag as it has been processed
+		delete(tagParamsMap, "decode")
+	}
+
+	// process remaining tags
+	for key, value := range tagParamsMap {
 		switch key {
 		case "key":
 			// override the default key if one is specified
@@ -159,11 +173,12 @@ func (v *Var) Parse(field reflect.StructField) error {
 			// if val != false {
 			v.SetRequired(true)
 			// }
-                case "yaml":
-                        // set yaml conversion to true
-                        v.SetYaml(true)
+		// for completeness, but should have been removed already
+		case "decode":
+			// set decode strategy
+			v.SetDecode(value)
 		case "default":
-			d, err := convert(v.Type, value)
+			d, err := convert(v.Type, value, v.Decode)
 			if err != nil {
 				return err
 			}
@@ -173,7 +188,7 @@ func (v *Var) Parse(field reflect.StructField) error {
 			// var values []reflect.Value
 			values := make([]reflect.Value, len(in))
 			for k, val := range in {
-				v1, err := convert(v.Type, val)
+				v1, err := convert(v.Type, val, v.Decode)
 				if err != nil {
 					return err
 				}
@@ -186,33 +201,39 @@ func (v *Var) Parse(field reflect.StructField) error {
 	return nil
 }
 
-func convertYaml(t reflect.Type, value string) (reflect.Value, error) {
-    a := reflect.New(t)
-
-    err := yaml.Unmarshal([]byte(value), a.Interface())
-
-    if err != nil {
-        fmt.Print(err)
-        return reflect.ValueOf(nil), conversionError(value, `yaml conversion error of ` + t.Kind().String())
-    }
-
-    return a.Elem(), nil
-}
-
-// Convert a string into the specified type. Return the type's zero value
-// if we receive an empty string
-func convert(t reflect.Type, value string) (reflect.Value, error) {
+// Convert a string into the specified type.
+// Return the type's zero value if we receive an empty string
+// Use the decode strategy defined
+func convert(t reflect.Type, value string, decode string) (reflect.Value, error) {
 	if value == "" {
 		return reflect.ValueOf(nil), nil
 	}
 
-	var d time.Duration
+	switch decode {
+	// if no decode defined, try with type and then kind
+	// if any type is defined then it will be used else fallback to kind
+	case "":
+		val, err := convertWithType(t, value)
 
-	switch t {
-	case reflect.TypeOf(d):
-		result, err := time.ParseDuration(value)
-		return reflect.ValueOf(result), err
+		if (err != nil) {
+			val, err = convertWithKind(t , value)
+		}
+
+		return val, err
+	case "kind":
+		return convertWithKind(t, value)
+	case "type":
+		return convertWithType(t, value)
+	case "yaml":
+		return convertWithYaml(t, value)
 	default:
+		return reflect.ValueOf(nil), conversionError(decode, `unsupported decode`)
+	}
+}
+
+func convertWithKind(t reflect.Type, value string) (reflect.Value, error) {
+	if value == "" {
+		return reflect.ValueOf(nil), nil
 	}
 
 	switch t.Kind() {
@@ -225,9 +246,29 @@ func convert(t reflect.Type, value string) (reflect.Value, error) {
 		return parseInt(value)
 	case reflect.Bool:
 		return parseBool(value)
+	case reflect.Slice:
+		return parseSlice(t, value)
+	case reflect.Map:
+		return parseMap(t, value)
 	}
 
 	return reflect.ValueOf(nil), conversionError(value, `unsupported `+t.Kind().String())
+}
+
+func convertWithType(t reflect.Type, value string) (reflect.Value, error) {
+	// Use string value of type to determine type
+	// Avoid declaring temporary vars just to get type
+	switch t.String() {
+	case "time.Duration":
+		result, err := time.ParseDuration(value)
+		return reflect.ValueOf(result), err
+	default:
+		return reflect.ValueOf(nil), conversionError(value, `unsupported type ` + t.String())
+	}
+}
+
+func convertWithYaml(t reflect.Type, value string) (reflect.Value, error) {
+	return parseYaml(t, value)
 }
 
 type errConversion struct {
@@ -271,4 +312,29 @@ func parseFloat(value string) (reflect.Value, error) {
 		return reflect.ValueOf(nil), conversionError(value, "float64")
 	}
 	return reflect.ValueOf(b), nil
+}
+
+// Using YAML syntax by default for slice
+// JSON is a subset of YAML syntax, so both will parse
+func parseSlice(t reflect.Type, value string) (reflect.Value, error) {
+	return parseYaml(t, value)
+}
+
+// Using YAML syntax by default for map
+// JSON is a subset of YAML syntax, so both will parse
+func parseMap(t reflect.Type, value string) (reflect.Value, error) {
+	return parseYaml(t, value)
+}
+
+func parseYaml(t reflect.Type, value string) (reflect.Value, error) {
+	a := reflect.New(t)
+
+	err := yaml.Unmarshal([]byte(value), a.Interface())
+
+	if err != nil {
+		fmt.Print(err)
+		return reflect.ValueOf(nil), conversionError(value, `yaml conversion error; Kind(): ` + t.Kind().String() + `; Type(): ` + t.String())
+	}
+
+	return a.Elem(), nil
 }
